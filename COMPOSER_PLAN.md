@@ -2,28 +2,28 @@
 
 ## 1. Goal
 
-Build a Composer-owned research system that searches over valid Symphony DSL programs, scores them with a learned out-of-sample alpha model, validates promising candidates with backtests, and eventually composes a diversified portfolio of strategies.
+Adapt upstream `autoresearch` into a Composer-specific research harness that helps an agent search for strong Symphony DSL candidates without starting from a blank page.
 
-This fork should not be treated as a drop-in deployment of upstream `autoresearch`. The upstream repo demonstrates a pattern:
+The initial version should stay close to the upstream shape:
 
-- keep the codebase small
-- give the agent a measurable objective
-- run repeated fixed-budget experiments
-- keep changes only when the metric improves
+- `prepare.py` prepares the fixed research environment and corpus-derived assets
+- `train.py` runs a barebones strategy search loop
+- `program.md` tells the agent how to improve `train.py` over time
 
-That pattern is useful for Composer, but the actual workload is different. Upstream optimizes an LLM training loop. Composer needs to optimize a strategy search loop.
+The main difference from upstream is the executable loop. Upstream runs short LLM training experiments. Composer should begin with a corpus-seeded strategy search loop that scores Symphony candidates with a fixed OOS prediction model and validates the best ones with backtests.
 
 ## 2. Decision Summary
 
-The plan is:
+The updated plan is:
 
-1. Preserve the upstream repo as the reference implementation of the `autoresearch` pattern.
-2. Add Composer-specific research code next to it instead of forcing the Composer problem into the existing `train.py`.
-3. Start with offline flat strategy search.
-4. Require backtest-based validation before any candidate is treated as real.
-5. Delay recursive strategy-of-strategy composition until the flat pipeline is trustworthy.
-6. Use GCP because local H100-class compute is unavailable.
-7. Use H100 only where it is actually needed, primarily reward-model training or heavy batched inference. Do not assume every part of the system needs H100.
+1. Keep the repo small and use the upstream file layout as the initial interface.
+2. Use the existing Symphony corpus as the starting point for search, not free-form generation from scratch.
+3. Put corpus ingestion, deduping, seeding, and fixed evaluation-set creation into `prepare.py`.
+4. Put a minimal search / score / shortlist / checkpoint loop into `train.py`.
+5. Put agent operating instructions into `program.md`, with the expectation that the agent mostly edits `train.py`.
+6. Treat the OOS prediction model as a fixed reward model during any one optimizer-improvement cycle.
+7. Keep backtest gating mandatory for top candidates.
+8. Use GCP because local H100-class compute is unavailable, but do not assume every step needs H100.
 
 ## 3. What We Are Building
 
@@ -32,8 +32,8 @@ The plan is:
 Given:
 
 - a Symphony DSL program
-- a validator/compiler for that DSL
-- a learned model that predicts OOS alpha and related risk signals
+- a large historical corpus of existing Symphonies and their metrics
+- a learned model that predicts OOS alpha and related quality signals
 
 Find:
 
@@ -43,9 +43,9 @@ Find:
 
 ### Working objective
 
-For a single candidate strategy `S`, use an objective like:
+For a candidate strategy `S`, use an objective like:
 
-`score(S) = predicted_alpha(S) - penalties(S)`
+`score(S) = predicted_oos_alpha(S) - penalties(S)`
 
 Where penalties include:
 
@@ -54,11 +54,11 @@ Where penalties include:
 - excessive turnover
 - concentration
 - liquidity and capacity issues
-- out-of-distribution uncertainty
+- low-confidence / out-of-distribution predictions
 
-For portfolio construction, use:
+For portfolio construction later:
 
-`portfolio_score(S, P) = predicted_alpha(S) - corr_penalty(S, P) - penalties(S)`
+`portfolio_score(S, P) = predicted_oos_alpha(S) - corr_penalty(S, P) - penalties(S)`
 
 Where `P` is the current selected set.
 
@@ -68,370 +68,311 @@ Where `P` is the current selected set.
 - no automatic deployment to customer accounts
 - no recursive composition in the first release
 - no trust in the reward model without backtest gating
-- no assumption that LLM free-form generation is enough on its own
+- no requirement that the LLM invent strategies from scratch
 
 ## 4. How This Relates To Upstream Autoresearch
 
-Upstream `autoresearch` is a meta-optimization loop. It edits the code that performs training, runs a short experiment, and keeps the change only if the metric improves.
+Upstream `autoresearch` fixes the evaluation harness and lets the agent iteratively improve `train.py`.
 
-Composer should borrow that pattern in two stages.
+Composer should mirror that pattern:
 
-### Stage 1: build the search system
+- humans define the fixed setup in `prepare.py`
+- humans define the research policy in `program.md`
+- the agent starts from a barebones `train.py` and improves it over time
 
-Implement a fixed search loop that can:
+The key adaptation is that Composer's `train.py` is not training an LLM. It is running a strategy search loop over Symphony candidates.
 
-- generate Symphony candidates
-- validate them
-- score them
-- backtest top candidates
-- rank survivors
+### Stage 1 meaning
 
-At this stage, the agent is optimizing Symphony candidates, not the optimizer itself.
+In the first Composer version, `train.py` should:
 
-### Stage 2: let the agent improve the optimizer
+- load a prepared seed pool from the existing Symphony corpus
+- generate or mutate candidates from those seeds
+- score them with a fixed reward model
+- backtest the top `K`
+- rank and checkpoint the results
 
-Once the search loop exists, use the `autoresearch` pattern on the search code itself:
+At this stage, the agent is improving the search procedure, not training a generator model.
 
-- mutation operators
-- seed generation
-- candidate selection
-- objective weights
-- deduping logic
-- portfolio assembly rules
-- backtest triage thresholds
+### Later stages
 
-That is the point where this genuinely becomes a Composer adaptation of `autoresearch`, rather than a standard search system.
+Only after the search loop is working should we consider:
 
-## 5. Proposed Repository Shape
+- recursive strategy composition
+- training a generator model to propose better candidates
+- letting the agent modify more than `train.py`
 
-The upstream repo is intentionally minimal. We should keep that quality, but not overload `train.py` with Composer-specific logic.
+## 5. Role Of The Existing Symphony Corpus
 
-Recommended additions:
+The existing corpus is the most important advantage we have over a blank-slate setup.
 
-```text
-COMPOSER_PLAN.md
-composer/
-  search.py
-  generate.py
-  mutate.py
-  validate.py
-  score.py
-  backtest_gate.py
-  portfolio.py
-  checkpoints.py
-programs/
-  composer-search.md
-  composer-optimizer.md
-infra/
-  gcp/
-    batch/
-    compute/
-    startup/
-docs/
-  architecture.md
-  operations.md
-```
+The corpus should be treated as:
 
-Repository conventions:
+- a warm-start seed bank
+- a source of canonical valid strategies
+- a source of benchmark strategies for evaluation
+- a source of negative examples, duplicates, and weird edge cases
 
-- keep upstream files readable and mostly untouched
-- keep Composer logic under a dedicated `composer/` package
-- keep agent instructions in separate `programs/` files
-- keep infrastructure configs under `infra/gcp/`
+The initial system should not ask the LLM to invent candidate Symphonies from nothing. It should begin by retrieving, mutating, and recombining existing strategies from the corpus.
 
-## 6. System Architecture
-
-### 6.1 Search controller
-
-This is the orchestration layer. It owns one research run.
-
-Responsibilities:
-
-- load the experiment config
-- generate or load seed strategies
-- submit candidate batches for scoring
-- trigger backtests for shortlisted candidates
-- write results and checkpoints
-- decide which candidates advance
-
-### 6.2 Candidate generator
-
-This should not rely only on free-form LLM output.
-
-It should support:
-
-- hand-built Composer strategy templates
-- grammar-aware mutations
-- parameter perturbations
-- subtree substitution
-- template recombination
-- optional LLM generation constrained by DSL rules
-
-### 6.3 Validator and canonicalizer
-
-This is mandatory.
-
-Responsibilities:
-
-- reject invalid DSL
-- compile to canonical form
-- normalize equivalent strategies to the same representation
-- compute complexity features
-- dedupe near-identical strategies
-
-Without canonicalization, the search will waste time on syntactic variants of the same strategy.
-
-### 6.4 Reward model service
-
-The reward model should return more than one number.
+### What `prepare.py` should extract from the corpus
 
 At minimum:
 
-- predicted OOS alpha
-- confidence or uncertainty
-- predicted turnover or cost proxy
-- predicted concentration or exposure proxy
-- out-of-distribution score
+- a canonicalized strategy representation
+- deduped or near-deduped strategy rows
+- a seed set for search
+- a fixed benchmark set for evaluating search-loop changes
+- a holdout set for checking reward-model drift or search overfitting
 
-The search objective should penalize low-confidence or out-of-distribution candidates.
+The corpus almost certainly contains many copies or small variants. That is fine, but `prepare.py` should reduce the operational dataset to something closer to unique strategy structures so the search loop is not dominated by duplicates.
 
-### 6.5 Backtest gate
+## 6. Proposed Repository Shape
 
-Backtests are not optional in practice.
+For the first Composer adaptation, keep the repo close to upstream:
 
-Use the reward model to filter cheaply, then backtest the top `K` candidates from each batch. Backtests should produce:
+```text
+COMPOSER_PLAN.md
+prepare.py
+train.py
+program.md
+README.md
+```
 
-- holdout return series
-- Sharpe and drawdown metrics
-- turnover and transaction-cost sensitivity
-- exposure diagnostics
-- benchmark-relative behavior
+Expected responsibilities:
 
-### 6.6 Portfolio constructor
+- `prepare.py`
+  - load exported Symphony corpus data
+  - canonicalize and dedupe enough for practical search
+  - materialize seed, benchmark, and holdout artifacts
+  - expose fixed helper functions used by `train.py`
+- `train.py`
+  - run the minimal strategy search loop
+  - score candidates with the fixed reward model
+  - backtest the top `K`
+  - checkpoint and print summary metrics
+- `program.md`
+  - tell the agent how to evaluate changes to `train.py`
+  - tell the agent to start from the corpus-derived assets
+  - define what is fixed versus editable
 
-After finding good standalone candidates, build a diversified set using:
+Only after this works should we consider breaking Composer-specific logic into more files or packages.
 
-- return correlation
-- factor or embedding similarity
-- turnover overlap
-- shared failure mode heuristics
+## 7. System Design For The Minimal Version
 
-Do not begin with recursive composition. First build a strong diversified set of flat strategies.
+### 7.1 `prepare.py`
 
-### 6.7 Experiment tracker
+`prepare.py` becomes the fixed environment builder.
 
-Each run should store:
+Its job is to:
 
-- commit hash
-- run config
-- seeds used
-- candidate specs
-- reward-model outputs
-- backtest summaries
-- selected survivors
-- artifacts and logs
+- ingest a local export or cloud snapshot of the Symphony corpus
+- build a canonical representation for each strategy
+- suppress obvious exact duplicates and optionally simple near-duplicates
+- write out a seed pool
+- write out a benchmark set
+- write out a holdout set
+- provide helper loaders for `train.py`
 
-This should live outside git. Use cloud storage and a queryable table.
+`prepare.py` should also define fixed evaluation boundaries, the same way upstream fixes `evaluate_bpb`.
 
-## 7. Recommended Phases
+### 7.2 `train.py`
+
+The first Composer `train.py` should be intentionally simple.
+
+It should:
+
+- load the prepared seed pool
+- pick an initial batch of candidates from the corpus
+- apply simple mutations or recombinations
+- score each candidate with the fixed OOS prediction model
+- backtest the top `K`
+- keep the best results under a fixed run budget
+- print a small fixed summary at the end
+
+This gives the agent something concrete to improve without requiring a big framework first.
+
+### 7.3 `program.md`
+
+`program.md` should be rewritten for the Composer problem.
+
+It should tell the agent:
+
+- what `prepare.py` is responsible for and that it is fixed
+- that the corpus already exists and should be treated as the starting prior
+- that `train.py` is the main editable surface
+- what metrics matter
+- when a change should be kept or discarded
+- that top candidates must be backtested before they are treated as wins
+
+### 7.4 Fixed metrics for the agent
+
+The agent needs a stable notion of improvement.
+
+For the initial loop, improvement should be measured on a fixed benchmark set derived from the corpus and a fixed reward-model snapshot, plus backtest validation for shortlisted candidates.
+
+The metric must not drift inside the same optimizer-improvement cycle.
+
+## 8. Recommended Phases
 
 ### Phase 0: bootstrap
 
 - fork the repo into `invest-composer`
-- create a working branch for the first planning/documentation pass
-- keep the upstream layout intact
-- document architecture and operating model
+- document the plan
+- identify the corpus export format
+- decide the first fixed metrics and artifact paths
 
 Exit criteria:
 
 - repo exists under Composer ownership
 - plan document exists
-- GCP target architecture is chosen
+- the initial corpus input format is chosen
 
-### Phase 1: flat offline search
+### Phase 1: corpus preparation
 
-Build a single-run controller that searches only flat strategies.
+Teach `prepare.py` to build the fixed research assets.
 
 Scope:
 
-- input: strategy templates and mutation rules
-- scoring: reward model only
-- validation: DSL compile plus canonicalization
-- selection: top `N` by score
-- checkpointing: required
+- load corpus snapshot
+- canonicalize strategies
+- suppress duplicates enough for useful seeding
+- write seed / benchmark / holdout artifacts
 
 Exit criteria:
 
-- system can complete a full offline search run
-- invalid strategies are filtered correctly
-- duplicate candidates are suppressed
+- `prepare.py` can run end-to-end on a representative corpus snapshot
+- the resulting seed pool is materially smaller than the raw copied corpus
+- the benchmark and holdout sets are fixed and reproducible
+
+### Phase 2: barebones search loop
+
+Build the first Composer `train.py`.
+
+Scope:
+
+- load prepared assets
+- sample candidates from the seed pool
+- apply a minimal mutation / recombination strategy
+- score with the fixed reward model
+- backtest the top `K`
+- emit a fixed summary and checkpoints
+
+Exit criteria:
+
+- a single run completes end-to-end
+- top candidates come from corpus-seeded search, not blank generation
 - results are reproducible from a saved config
 
-### Phase 2: backtest-gated ranking
+### Phase 3: agent-facing `program.md`
 
-Add a backtest validation step for top candidates.
-
-Scope:
-
-- backtest the top `K`
-- compute real diversification metrics
-- rank by robust holdout metrics, not just predicted alpha
-
-Exit criteria:
-
-- shortlist contains only candidates that survive backtest validation
-- reward-model ranking and backtest ranking can be compared quantitatively
-- failure cases are logged for reward-model retraining
-
-### Phase 3: portfolio search
-
-Build a diversified portfolio from validated candidates.
+Rewrite `program.md` so the agent can begin improving `train.py`.
 
 Scope:
 
-- portfolio-level objective
-- correlation penalty
-- exposure diversity
-- strategy clustering
+- describe the Composer objective
+- define what is fixed and what can change
+- define the experiment loop and output format
+- instruct the agent to use corpus-derived assets, not fresh invention
 
 Exit criteria:
 
-- system can return a set of candidates, not just a single winner
-- portfolio selection is measurably more diversified than naive top-`N`
+- a coding agent can read `program.md` and run one valid experiment cycle
+- the agent has an unambiguous success metric
 
-### Phase 4: recursive composition
+### Phase 4: backtest-gated ranking
 
-Only after flat search works.
+Tighten candidate ranking beyond the first proof of concept.
 
 Scope:
 
-- allow strategies to reference previously selected strategies
-- enforce acyclic dependency checks
-- cap depth and node count
-- require readability and complexity limits
+- compare reward-model ranking versus backtest ranking
+- track disagreement cases
+- refine shortlist rules
 
 Exit criteria:
 
-- recursive strategies compile reliably
-- search does not collapse into unreadable meta-trees
-- backtests show incremental value beyond flat ensemble selection
+- the system keeps only candidates that survive backtest validation
+- backtest outcomes are logged as a first-class output
 
-### Phase 5: self-improving optimizer
+### Phase 5: recursive composition and richer search
 
-This is the true `autoresearch` stage.
+Only after the first loop is stable.
 
 Scope:
 
-- agent edits the search code and prompt/program files
-- each run is evaluated on a fixed benchmark set
-- optimizer changes are kept only if aggregate run quality improves
+- recursive strategy composition
+- deeper mutation policies
+- more structured recombination
+- possibly generator-model training later
 
 Exit criteria:
 
-- search-code changes are benchmarked automatically
-- the optimizer gets better over time, not just the current candidate set
+- recursive search adds value beyond flat corpus-seeded search
 
-## 8. GCP Deployment Plan
+## 9. GCP Deployment Plan
 
-## 8.1 Principles
+## 9.1 Principles
 
-- separate control-plane services from GPU-heavy worker jobs
-- checkpoint aggressively because the most attractive 1x H100 A3 shapes are Spot or Flex-start only
-- keep all generated strategies and metrics offline until reviewed
-- use managed services for logs, secrets, and artifact storage
+- start with the smallest operational setup that can support a reliable run
+- keep the benchmark sets and prepared corpus artifacts fixed for each experiment cycle
+- checkpoint aggressively because the best-fit small H100 A3 shapes are Spot or Flex-start
+- separate one-time preparation work from repeated search runs
 
-## 8.2 Recommended GCP components
+## 9.2 Minimal deployment shape
 
-Use:
+Start with one repo, one worker, and cloud storage.
 
-- `Compute Engine` for initial interactive GPU setup and debugging
-- `Batch` for repeatable GPU jobs once the runner is stable
-- `Cloud Storage` for checkpoints, logs, and experiment artifacts
-- `Artifact Registry` for versioned worker containers
-- `Secret Manager` for API keys and internal credentials
-- `Cloud Logging` and `Cloud Monitoring` for observability
-- `BigQuery` or Cloud SQL for structured experiment metadata
-- `Cloud Run` or a small CPU VM for the orchestration API if needed
+Recommended components:
 
-## 8.3 GPU choice
+- `Compute Engine` GPU VM for the first interactive runs
+- `Cloud Storage` for corpus exports, prepared artifacts, checkpoints, and logs
+- `Artifact Registry` for a pinned worker image once the environment is stable
+- `Secret Manager` for credentials
+- `Cloud Logging` / `Cloud Monitoring` for basic observability
 
-Upstream `autoresearch` says it was tested on a single H100. Google Cloud currently offers `a3-highgpu-1g` with 1x H100 80GB, 26 vCPU, and 234 GB RAM. Google also documents that `a3-highgpu-1g`, `a3-highgpu-2g`, and `a3-highgpu-4g` must be created as `Spot` or `Flex-start` VMs.
+Delay a larger controller service until we actually need it.
+
+## 9.3 Where `prepare.py` runs
+
+`prepare.py` is mostly data preparation and artifact construction. It may not need an H100 at all.
+
+Recommended approach:
+
+- run `prepare.py` on CPU if the corpus processing path fits comfortably there
+- only move it onto a GPU machine if reward-model inference during preparation becomes expensive
+- write prepared artifacts to GCS so `train.py` runs can reuse them
+
+## 9.4 Where `train.py` runs
+
+`train.py` is the first likely GPU consumer because it may need repeated reward-model inference and repeated backtest triage.
+
+Recommended approach:
+
+- bootstrap on a single manually managed Compute Engine GPU VM
+- once stable, move unattended runs to `Batch`
+- keep runs resumable from checkpoints stored in GCS
+
+## 9.5 GPU choice
+
+Upstream `autoresearch` says it was tested on a single H100. On GCP, the closest match is `a3-highgpu-1g` with 1x H100 80GB. Google documents that the small A3 High shapes are Spot or Flex-start only.
 
 Implications:
 
-- use `a3-highgpu-1g` for reward-model training or very heavy batched inference
-- do not bind the full system to H100 if cheaper machines are enough for orchestration and search
-- expect preemption or delayed starts and design for resume
+- use `a3-highgpu-1g` if the reward model or search loop actually benefits from H100 throughput
+- do not force `prepare.py` onto H100 unless needed
+- design `train.py` runs to survive interruption
 
-## 8.4 Initial deployment recommendation
+If the reward model can score efficiently on a smaller GPU, validate L4-based shapes before standardizing on H100.
 
-Start with two layers.
+## 9.6 Storage layout
 
-### Layer A: controller
-
-Run on CPU-only infrastructure:
-
-- a small `Cloud Run` service, or
-- a small `e2-standard` / `c3-standard` Compute Engine VM
-
-Responsibilities:
-
-- create experiment configs
-- enqueue search runs
-- monitor job state
-- collect outputs
-- write metadata rows
-
-### Layer B: worker
-
-Run as a GPU job:
-
-- bootstrap option: single `Compute Engine` VM for manual iteration
-- production option: `Batch` jobs backed by GPU VMs
-
-Responsibilities:
-
-- fetch repo revision and config
-- load the reward model
-- run search batches
-- checkpoint progress to GCS
-- upload logs and metrics
-
-## 8.5 Machine recommendations
-
-Use the cheapest machine that fits the task.
-
-Recommended defaults:
-
-- reward-model training: `a3-highgpu-1g`
-- heavy reward-model inference or large batched scoring: `a3-highgpu-1g`
-- ordinary orchestration and metadata work: CPU-only VM or Cloud Run
-- if the reward model can score on smaller GPUs, evaluate `g2`/L4 separately before standardizing on H100
-
-The likely mistake here is overprovisioning. Composer should only pay H100 prices where H100 materially improves throughput or model quality.
-
-## 8.6 OS and runtime
-
-For the first GPU worker image:
-
-- use Ubuntu 22.04 or 24.04
-- use `uv` for dependency management
-- build a pinned container image in Artifact Registry
-
-Google Cloud currently recommends CUDA `12.2.2` or later for A3 H100 VMs, and its GPU driver install docs describe the supported Linux images and startup-script flow.
-
-Practical recommendation:
-
-- create a custom image or container that already has the right driver and CUDA setup validated
-- avoid relying on ad hoc manual setup for repeatable jobs
-
-## 8.7 Storage layout
-
-Create a dedicated GCS bucket, for example:
+Use a dedicated GCS bucket, for example:
 
 ```text
 gs://composer-autoresearch-dev/
-  configs/
+  corpus/
+  prepared/
   checkpoints/
   logs/
   results/
@@ -439,144 +380,99 @@ gs://composer-autoresearch-dev/
   models/
 ```
 
-Use GCS for:
+Use it for:
 
-- search checkpoints
-- serialized candidate batches
+- raw or exported corpus snapshots
+- prepared seed / benchmark / holdout artifacts
+- run checkpoints
 - backtest outputs
 - reward-model snapshots
-- worker logs that should survive preemption
+- logs that must survive preemption
 
-Use BigQuery or Cloud SQL for:
+## 9.7 Runtime environment
 
-- experiment metadata
-- run status
-- candidate summaries
-- aggregate metrics
+For the first GPU worker:
 
-## 8.8 Batch job model
+- Ubuntu 22.04 or 24.04
+- `uv` for dependency management
+- pinned container image in Artifact Registry once the environment is stable
 
-When the worker code stabilizes, move GPU execution to Batch.
+Practical recommendation:
 
-Why Batch:
+- validate CUDA / driver setup once
+- then freeze the environment in an image or container
 
-- it provisions VMs per job
-- it is a better fit for repeatable offline runs than a hand-managed long-lived VM
-- it supports GPU jobs and driver installation options
+## 9.8 Observability and cost controls
 
-Recommended job behavior:
+Track at minimum:
 
-- one Batch job per experiment run
-- config passed via GCS path or environment
-- checkpoints written every few minutes or every `N` evaluated candidates
-- idempotent resume from the latest checkpoint
-- explicit max runtime and retry count
-
-## 8.9 Handling Spot or Flex-start constraints
-
-Because the most useful small A3 High shapes are not normal on-demand VMs, assume interruptions.
-
-Design requirements:
-
-- checkpoint frequently
-- persist logs outside the VM
-- make each run resumable
-- make job submission idempotent
-- use a controller that can relaunch from saved state
-
-If job start latency becomes a problem, keep a single manually managed debugging VM for developer work and use Batch only for unattended runs.
-
-## 8.10 Security
-
-Use a dedicated service account with least privilege:
-
-- read from the experiment bucket
-- write checkpoints and results
-- read secrets needed for model or API access
-
-Store in Secret Manager:
-
-- model API keys if applicable
-- GitHub token if CI automation needs it
-- internal Composer credentials
-
-Do not store secrets in repo files, shell history, or job configs committed to git.
-
-## 8.11 Observability
-
-Minimum required signals:
-
-- job success/failure counts
-- average candidates scored per run
-- reward-model latency
-- backtest queue depth
+- successful versus failed runs
 - checkpoint age
-- preemption/retry counts
-- cost per completed experiment
+- candidates scored per run
+- shortlist size and backtest pass rate
+- reward-model latency
+- preemption or retry count
+- cost per useful run
 
-Alert on:
+Controls:
 
-- repeated worker crashes
-- missing checkpoints for active jobs
-- large drift between reward-model ranking and backtest ranking
+- cap GPU concurrency
+- auto-stop idle debug VMs
+- set budget alerts
+- separate dev and prod budgets or projects
 
-## 8.12 Cost controls
+## 10. Data And Evaluation Plan
 
-Add hard controls from day one:
-
-- GPU job concurrency cap
-- automatic TTL for idle debug VMs
-- per-run budget limit
-- nightly or weekly budget alarms
-- separate dev and prod projects or budgets
-
-This project will otherwise spend money very quickly with little accountability.
-
-## 9. Data and Evaluation Plan
-
-The reward model is the main technical risk.
+The reward model remains the main technical risk.
 
 Requirements:
 
-- train on Composer-relevant strategy data
+- train it on Composer-relevant strategy data
 - keep strict temporal holdouts
-- test for reward hacking and distribution shift
-- log disagreement between predicted alpha and realized backtest quality
+- compare predicted ranking with realized backtest quality
+- audit for reward hacking and distribution shift
+
+The corpus should help in two ways:
+
+- it provides the seed pool for the search loop
+- it provides the fixed benchmark and holdout sets used to evaluate changes to `train.py`
 
 Key principle:
 
-The search should optimize a model that is constantly audited, not blindly trusted.
+Do not change the reward model and the search metric at the same time. Inside one optimizer-improvement cycle, freeze the reward-model version and evaluate all `train.py` changes against the same prepared benchmark set.
 
-Recommended evaluation sets:
-
-- a fixed benchmark set of known strategies
-- a held-out temporal slice
-- an adversarial set of weird but valid DSL strategies
-- a simplicity-biased slice to discourage unreadable strategies
-
-## 10. Risks
+## 11. Risks
 
 ### Reward hacking
 
-The search may find strategies that score well because of model blind spots.
+The search may find strategies that score well because of blind spots in the OOS prediction model.
 
 Mitigation:
 
-- uncertainty penalty
+- fixed reward-model snapshot per experiment cycle
 - backtest gating
-- adversarial test set
+- holdout benchmark set
 - periodic human review
+
+### Duplicate-heavy corpus
+
+The raw corpus may be dominated by copied strategies or tiny variants.
+
+Mitigation:
+
+- canonicalization in `prepare.py`
+- duplicate suppression before seeding
+- benchmark sets that are not copy-heavy
 
 ### Search collapse
 
-The system may rediscover the same family repeatedly.
+The system may stay too close to the corpus and fail to explore useful variants.
 
 Mitigation:
 
-- canonicalization
-- clustering
-- diversity-aware selection
-- seed variety
+- allow mutation and recombination in `train.py`
+- periodically widen the search radius
+- track whether shortlisted candidates are genuinely novel
 
 ### Recursive strategy explosion
 
@@ -584,57 +480,53 @@ Recursive composition can become unreadable and fragile.
 
 Mitigation:
 
-- defer recursion
-- enforce max depth
-- enforce node-count limits
-- add strong complexity penalties
+- defer recursion until the flat loop works
+- enforce depth and complexity limits later
 
 ### Compute waste
 
-H100-backed jobs can become expensive quickly.
+GPU-backed search can become expensive quickly.
 
 Mitigation:
 
-- use H100 only where justified
+- only use H100 where justified
 - checkpoint and resume
 - cap concurrency
-- track cost per useful experiment
+- track cost per useful run
 
-## 11. Immediate Next Steps
+## 12. Immediate Next Steps
 
 ### Repo work
 
-1. Commit this document.
-2. Add a `docs/architecture.md` that turns this plan into a component diagram.
-3. Add a minimal `composer/` package with stub modules and typed interfaces.
-4. Add `programs/composer-search.md` for the first fixed-search loop.
+1. Rewrite `prepare.py` around Composer corpus preparation and fixed research artifacts.
+2. Rewrite `program.md` around the Composer objective and fixed/editable boundaries.
+3. Replace `train.py` with a barebones corpus-seeded search loop.
+4. Keep the initial implementation deliberately small enough for an agent to iterate on.
 
 ### Product and research work
 
-1. Define the exact DSL validation and canonicalization contract.
+1. Choose the initial corpus export format and storage location.
 2. Define the reward-model API and output schema.
-3. Choose the shortlist backtest interface.
-4. Build a benchmark set of strategies for regression testing.
+3. Define the shortlist backtest interface.
+4. Decide the first fixed benchmark and holdout split policy.
 
 ### Infra work
 
-1. Create a dedicated GCP project or environment for autoresearch.
-2. Set up the GCS bucket, service account, and budget alerts.
-3. Bring up one manual GPU worker VM for debugging.
-4. Containerize the worker and migrate unattended runs to Batch.
+1. Create a GCS bucket for corpus snapshots, prepared artifacts, checkpoints, and results.
+2. Bring up one manual GCP GPU worker VM for the first `train.py` runs.
+3. Freeze the environment in a container or image.
+4. Add Batch once the first loop is stable.
 
-## 12. Recommended First Milestone
+## 13. Recommended First Milestone
 
-The first milestone should not be "recursive agentic optimization."
+The first milestone should be:
 
-It should be:
+"Run one reproducible corpus-seeded Composer search job where:
 
-"Run one reproducible offline search job that:
+- `prepare.py` ingests the Symphony corpus and writes fixed seed / benchmark / holdout artifacts
+- `train.py` loads those artifacts and runs a minimal search loop
+- the reward model scores candidates under a fixed version
+- the top `K` candidates are backtested
+- the run writes checkpoints and a ranked summary to GCS or local artifacts"
 
-- starts from a fixed seed set
-- generates and validates flat Symphony candidates
-- scores them with the reward model
-- backtests the top `K`
-- writes a ranked results table and checkpoints to GCS"
-
-If that milestone is not solid, the recursive story is premature.
+If that milestone is not solid, the more ambitious recursive story is premature.
