@@ -23,7 +23,7 @@ The updated plan is:
 5. Put agent operating instructions into `program.md`, with the expectation that the agent mostly edits `train.py`.
 6. Treat the OOS prediction model as a fixed reward model during any one optimizer-improvement cycle.
 7. Keep backtest gating mandatory for top candidates.
-8. Use GCP because local H100-class compute is unavailable, but do not assume every step needs H100.
+8. Do the initial build and experimentation locally, and defer GCP until the local loop is proven useful.
 
 ## 3. What We Are Building
 
@@ -310,67 +310,68 @@ Exit criteria:
 
 - recursive search adds value beyond flat corpus-seeded search
 
-## 9. GCP Deployment Plan
+## 9. Local-First Execution Plan
 
 ## 9.1 Principles
 
-- start with the smallest operational setup that can support a reliable run
+- start with the smallest setup that supports an end-to-end run on one developer machine
 - keep the benchmark sets and prepared corpus artifacts fixed for each experiment cycle
-- checkpoint aggressively because the best-fit small H100 A3 shapes are Spot or Flex-start
+- prefer simplicity and debuggability over parallelism
 - separate one-time preparation work from repeated search runs
+- defer cloud complexity until local runs are clearly bottlenecked
 
-## 9.2 Minimal deployment shape
+## 9.2 Minimal local shape
 
-Start with one repo, one worker, and cloud storage.
+Start with one repo and one local worker process.
 
 Recommended components:
 
-- `Compute Engine` GPU VM for the first interactive runs
-- `Cloud Storage` for corpus exports, prepared artifacts, checkpoints, and logs
-- `Artifact Registry` for a pinned worker image once the environment is stable
-- `Secret Manager` for credentials
-- `Cloud Logging` / `Cloud Monitoring` for basic observability
+- local filesystem for corpus exports, prepared artifacts, checkpoints, and logs
+- one local Python environment managed by `uv`
+- one local run directory per experiment
+- lightweight structured logs written to files
 
-Delay a larger controller service until we actually need it.
+Delay cloud storage, remote workers, and job orchestration until we actually need them.
 
 ## 9.3 Where `prepare.py` runs
 
-`prepare.py` is mostly data preparation and artifact construction. It may not need an H100 at all.
+`prepare.py` should run locally first. It is mainly data preparation and artifact construction.
 
 Recommended approach:
 
 - run `prepare.py` on CPU if the corpus processing path fits comfortably there
-- only move it onto a GPU machine if reward-model inference during preparation becomes expensive
-- write prepared artifacts to GCS so `train.py` runs can reuse them
+- only use local GPU acceleration if reward-model inference during preparation is expensive
+- write prepared artifacts to a deterministic local directory so `train.py` runs can reuse them
 
 ## 9.4 Where `train.py` runs
 
-`train.py` is the first likely GPU consumer because it may need repeated reward-model inference and repeated backtest triage.
+`train.py` should also run locally first. It is the first likely GPU consumer because it may need repeated reward-model inference and repeated backtest triage.
 
 Recommended approach:
 
-- bootstrap on a single manually managed Compute Engine GPU VM
-- once stable, move unattended runs to `Batch`
-- keep runs resumable from checkpoints stored in GCS
+- start on the current local machine, even if it is slower than ideal
+- keep the first loop small enough that it can complete locally
+- checkpoint to local disk
+- only introduce remote execution once local debugging becomes the bottleneck
 
-## 9.5 GPU choice
+## 9.5 Local compute strategy
 
-Upstream `autoresearch` says it was tested on a single H100. On GCP, the closest match is `a3-highgpu-1g` with 1x H100 80GB. Google documents that the small A3 High shapes are Spot or Flex-start only.
+Upstream `autoresearch` was tested on a single H100 for LLM training. That should not drive the first Composer implementation.
 
 Implications:
 
-- use `a3-highgpu-1g` if the reward model or search loop actually benefits from H100 throughput
-- do not force `prepare.py` onto H100 unless needed
-- design `train.py` runs to survive interruption
+- keep `prepare.py` and the first `train.py` loop small enough for local iteration
+- reduce search breadth, top-`K`, or run budget if needed to fit the local machine
+- optimize first for correctness and inspectability, not throughput
 
-If the reward model can score efficiently on a smaller GPU, validate L4-based shapes before standardizing on H100.
+If local runs prove too slow, that is the point to measure the bottleneck and decide whether cloud GPU is actually necessary.
 
-## 9.6 Storage layout
+## 9.6 Local storage layout
 
-Use a dedicated GCS bucket, for example:
+Use a dedicated local artifact directory, for example:
 
 ```text
-gs://composer-autoresearch-dev/
+./artifacts/
   corpus/
   prepared/
   checkpoints/
@@ -387,20 +388,23 @@ Use it for:
 - run checkpoints
 - backtest outputs
 - reward-model snapshots
-- logs that must survive preemption
+- logs and run summaries
+
+These directories can later be mirrored to cloud storage if local-first execution works.
 
 ## 9.7 Runtime environment
 
-For the first GPU worker:
+For the first local worker:
 
-- Ubuntu 22.04 or 24.04
 - `uv` for dependency management
-- pinned container image in Artifact Registry once the environment is stable
+- one reproducible local environment
+- simple local scripts for setup and execution
 
 Practical recommendation:
 
-- validate CUDA / driver setup once
-- then freeze the environment in an image or container
+- validate the local environment once
+- keep dependencies pinned
+- only containerize after the local workflow is stable
 
 ## 9.8 Observability and cost controls
 
@@ -411,15 +415,24 @@ Track at minimum:
 - candidates scored per run
 - shortlist size and backtest pass rate
 - reward-model latency
-- preemption or retry count
-- cost per useful run
+- local runtime per useful run
 
 Controls:
 
-- cap GPU concurrency
-- auto-stop idle debug VMs
-- set budget alerts
-- separate dev and prod budgets or projects
+- keep one run at a time until the loop is stable
+- cap local artifact growth
+- record per-run runtime so we know when local execution stops being practical
+
+## 9.9 Deferred cloud plan
+
+If local execution proves useful but too slow, move in this order:
+
+1. local artifacts mirrored to cloud storage
+2. one manually managed remote worker
+3. reproducible remote image or container
+4. batch-style unattended runs
+
+Cloud is a scaling phase, not a prerequisite for the first milestone.
 
 ## 10. Data And Evaluation Plan
 
@@ -485,14 +498,13 @@ Mitigation:
 
 ### Compute waste
 
-GPU-backed search can become expensive quickly.
+Local iteration may be too slow to support useful search.
 
 Mitigation:
 
-- only use H100 where justified
-- checkpoint and resume
-- cap concurrency
-- track cost per useful run
+- shrink the search loop until it is debuggable locally
+- profile the real bottleneck before scaling out
+- only introduce cloud compute after we can justify it with measurements
 
 ## 12. Immediate Next Steps
 
@@ -512,10 +524,10 @@ Mitigation:
 
 ### Infra work
 
-1. Create a GCS bucket for corpus snapshots, prepared artifacts, checkpoints, and results.
-2. Bring up one manual GCP GPU worker VM for the first `train.py` runs.
-3. Freeze the environment in a container or image.
-4. Add Batch once the first loop is stable.
+1. Choose a local artifact directory layout for corpus snapshots, prepared artifacts, checkpoints, and results.
+2. Validate one reproducible local environment for `prepare.py` and `train.py`.
+3. Add simple local scripts or commands for setup and execution.
+4. Revisit cloud only after the first local loop is stable.
 
 ## 13. Recommended First Milestone
 
@@ -527,6 +539,6 @@ The first milestone should be:
 - `train.py` loads those artifacts and runs a minimal search loop
 - the reward model scores candidates under a fixed version
 - the top `K` candidates are backtested
-- the run writes checkpoints and a ranked summary to GCS or local artifacts"
+- the run writes checkpoints and a ranked summary to local artifacts"
 
 If that milestone is not solid, the more ambitious recursive story is premature.
