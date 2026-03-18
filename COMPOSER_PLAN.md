@@ -10,7 +10,7 @@ The initial version should stay close to the upstream shape:
 - `train.py` runs a barebones strategy search loop
 - `program.md` tells the agent how to improve `train.py` over time
 
-The main difference from upstream is the executable loop. Upstream runs short LLM training experiments. Composer should begin with a corpus-seeded strategy search loop that scores Symphony candidates with a fixed OOS prediction model and validates the best ones with backtests.
+The main difference from upstream is the executable loop. Upstream runs short LLM training experiments. Composer should begin with a corpus-seeded strategy search loop that backtests Symphony candidates, feeds the resulting stats into a fixed OOS prediction model, and then ranks the candidates.
 
 ## 2. Decision Summary
 
@@ -43,24 +43,83 @@ Find:
 
 ### Working objective
 
-For a candidate strategy `S`, use an objective like:
+Because the OOS prediction model depends on backtest outputs, there is no true pre-backtest score. The minimal ranking loop is:
 
-`score(S) = predicted_oos_alpha(S) - penalties(S)`
+1. validate / compile the Symphony
+2. run the backtest
+3. compute the backtest-stat feature vector
+4. compute `predicted_oos_alpha`
+5. reject candidates that violate hard constraints
+6. apply a small number of extra penalties if they add value
+7. rank the survivors
 
-Where penalties include:
+So the working objective is:
 
-- invalid DSL or compile failure
-- excessive complexity
-- excessive turnover
-- concentration
-- liquidity and capacity issues
-- low-confidence / out-of-distribution predictions
+`score(S) = predicted_oos_alpha(S) - extra_penalties(S)`
+
+subject to:
+
+- valid DSL / successful compile
+- minimum backtest history
+- basic risk and quality constraints
 
 For portfolio construction later:
 
-`portfolio_score(S, P) = predicted_oos_alpha(S) - corr_penalty(S, P) - penalties(S)`
+`portfolio_score(S, P) = predicted_oos_alpha(S) - corr_penalty(S, P) - extra_penalties(S)`
 
 Where `P` is the current selected set.
+
+### Score function design
+
+The scoring function should not begin as a large hand-weighted mixture of backtest metrics. Many of those metrics are already inputs to the OOS prediction model, so using them again as soft penalties risks double-counting.
+
+The initial design should be:
+
+- use `predicted_oos_alpha` as the main score
+- use hard constraints for obviously unacceptable candidates
+- add only a small number of extra penalties for things the OOS model likely does not capture well or that reflect explicit product preferences
+
+Examples of likely hard constraints:
+
+- compile or backtest failure
+- too few backtest days
+- extreme annualized turnover
+- extreme Herfindahl concentration
+- extreme max drawdown
+- extreme return concentration, such as too much dependence on a small number of days
+
+Examples of likely extra penalties:
+
+- complexity penalty derived from DSL structure
+- out-of-distribution penalty in backtest-stat feature space
+- near-duplicate penalty against the existing corpus
+- portfolio-correlation penalty later, when selecting a basket instead of a single strategy
+
+Examples to defer initially:
+
+- liquidity penalty, unless we compute it from actual realized trades using daily holdings plus OHLCV
+- large weighted mixtures of Sharpe, Sortino, Calmar, skew, kurtosis, and related diagnostics
+
+The weights on any extra penalties should not be treated as fixed truths. Once we score the full historical corpus and have predicted OOS alpha for all feasible candidates, we should study the highest-scoring failures and use that empirical ranking behavior to decide which extra penalties are worth adding.
+
+In practice, that means:
+
+- start with `predicted_oos_alpha` plus hard constraints
+- inspect the ranked corpus for bad but highly scored candidates
+- add one penalty at a time
+- keep a penalty only if it improves historical selection quality on unseen data
+
+### Fragility of returns
+
+Return fragility should be derived from the backtest return series, not guessed from the DSL.
+
+The initial plan should treat fragility as a hard constraint candidate, not a carefully weighted soft term. Good first measures are:
+
+- concentration of total positive performance in the best few days
+- sensitivity of annualized return or Sharpe to removing the best few days
+- dependence on a single month or quarter
+
+The existing `train_top_ten_percent_day_contribution` stat is a useful starting point, but it should probably be supplemented later with a jackknife-style sensitivity metric from the full return series.
 
 ### Non-goals for v1
 
@@ -88,8 +147,8 @@ In the first Composer version, `train.py` should:
 
 - load a prepared seed pool from the existing Symphony corpus
 - generate or mutate candidates from those seeds
-- score them with a fixed reward model
-- backtest the top `K`
+- backtest the candidates
+- score them with a fixed reward model that consumes backtest stats
 - rank and checkpoint the results
 
 At this stage, the agent is improving the search procedure, not training a generator model.
@@ -148,8 +207,7 @@ Expected responsibilities:
   - expose fixed helper functions used by `train.py`
 - `train.py`
   - run the minimal strategy search loop
-  - score candidates with the fixed reward model
-  - backtest the top `K`
+  - backtest candidates and then score them with the fixed reward model
   - checkpoint and print summary metrics
 - `program.md`
   - tell the agent how to evaluate changes to `train.py`
@@ -174,7 +232,7 @@ Its job is to:
 - write out a holdout set
 - provide helper loaders for `train.py`
 
-`prepare.py` should also define fixed evaluation boundaries, the same way upstream fixes `evaluate_bpb`.
+`prepare.py` should also define fixed evaluation boundaries, the same way upstream fixes `evaluate_bpb`, including the fixed benchmark and holdout sets used to judge whether scoring changes are helping.
 
 ### 7.2 `train.py`
 
@@ -185,8 +243,9 @@ It should:
 - load the prepared seed pool
 - pick an initial batch of candidates from the corpus
 - apply simple mutations or recombinations
-- score each candidate with the fixed OOS prediction model
-- backtest the top `K`
+- backtest each feasible candidate
+- compute `predicted_oos_alpha` from the backtest outputs
+- apply hard constraints and any enabled extra penalties
 - keep the best results under a fixed run budget
 - print a small fixed summary at the end
 
@@ -201,15 +260,15 @@ It should tell the agent:
 - what `prepare.py` is responsible for and that it is fixed
 - that the corpus already exists and should be treated as the starting prior
 - that `train.py` is the main editable surface
-- what metrics matter
+- what metrics matter and which ones are constraints versus soft penalties
 - when a change should be kept or discarded
-- that top candidates must be backtested before they are treated as wins
+- that candidates must be backtested before predicted OOS alpha can even be computed
 
 ### 7.4 Fixed metrics for the agent
 
 The agent needs a stable notion of improvement.
 
-For the initial loop, improvement should be measured on a fixed benchmark set derived from the corpus and a fixed reward-model snapshot, plus backtest validation for shortlisted candidates.
+For the initial loop, improvement should be measured on a fixed benchmark set derived from the corpus and a fixed reward-model snapshot, plus the quality of the resulting ranked selection after constraints and any extra penalties are applied.
 
 The metric must not drift inside the same optimizer-improvement cycle.
 
@@ -254,8 +313,9 @@ Scope:
 - load prepared assets
 - sample candidates from the seed pool
 - apply a minimal mutation / recombination strategy
-- score with the fixed reward model
-- backtest the top `K`
+- backtest feasible candidates
+- compute predicted OOS alpha from the backtest stats
+- rank using hard constraints plus a minimal extra-penalty set
 - emit a fixed summary and checkpoints
 
 Exit criteria:
@@ -287,6 +347,7 @@ Tighten candidate ranking beyond the first proof of concept.
 Scope:
 
 - compare reward-model ranking versus backtest ranking
+- compare plain predicted-OOS ranking versus constrained / penalized ranking
 - track disagreement cases
 - refine shortlist rules
 
@@ -436,7 +497,7 @@ Cloud is a scaling phase, not a prerequisite for the first milestone.
 
 ## 10. Data And Evaluation Plan
 
-The reward model remains the main technical risk.
+The reward model remains the main technical risk, and the ranking function around it is the second one.
 
 Requirements:
 
@@ -445,14 +506,17 @@ Requirements:
 - compare predicted ranking with realized backtest quality
 - audit for reward hacking and distribution shift
 
-The corpus should help in two ways:
+The corpus should help in three ways:
 
 - it provides the seed pool for the search loop
 - it provides the fixed benchmark and holdout sets used to evaluate changes to `train.py`
+- it lets us inspect the full ranked distribution of predicted OOS alpha and empirically decide which extra penalties are actually useful
 
-Key principle:
+Key principles:
 
 Do not change the reward model and the search metric at the same time. Inside one optimizer-improvement cycle, freeze the reward-model version and evaluate all `train.py` changes against the same prepared benchmark set.
+
+Do not introduce extra penalties just because they sound reasonable. Add them only after they improve historical selection quality or encode an explicit business preference.
 
 ## 11. Risks
 
@@ -506,6 +570,17 @@ Mitigation:
 - profile the real bottleneck before scaling out
 - only introduce cloud compute after we can justify it with measurements
 
+### Arbitrary score shaping
+
+The ranking function may become an unprincipled collection of hand-picked penalty weights.
+
+Mitigation:
+
+- start from predicted OOS alpha plus hard constraints
+- derive candidate penalty thresholds from the empirical corpus distribution
+- add penalties one at a time
+- keep them only if they improve unseen historical ranking quality or reflect a clear product policy
+
 ## 12. Immediate Next Steps
 
 ### Repo work
@@ -519,8 +594,9 @@ Mitigation:
 
 1. Choose the initial corpus export format and storage location.
 2. Define the reward-model API and output schema.
-3. Define the shortlist backtest interface.
+3. Define the shortlist backtest interface and the return-series outputs needed for fragility calculations.
 4. Decide the first fixed benchmark and holdout split policy.
+5. Evaluate the plain predicted-OOS ranking on the historical corpus before adding extra penalties.
 
 ### Infra work
 
@@ -537,8 +613,9 @@ The first milestone should be:
 
 - `prepare.py` ingests the Symphony corpus and writes fixed seed / benchmark / holdout artifacts
 - `train.py` loads those artifacts and runs a minimal search loop
-- the reward model scores candidates under a fixed version
-- the top `K` candidates are backtested
+- the reward model scores candidates under a fixed version after backtests run
+- the first ranking pass uses predicted OOS alpha plus hard constraints, with at most a very small extra-penalty set
+- the top `K` ranked candidates are surfaced for review and comparison
 - the run writes checkpoints and a ranked summary to local artifacts"
 
 If that milestone is not solid, the more ambitious recursive story is premature.
